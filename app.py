@@ -1,25 +1,85 @@
+import os, io, traceback
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import openpyxl
+import openpyxl.utils
+from openpyxl.styles.colors import COLOR_INDEX
 from reportlab.lib.pagesizes import A4, A3, letter, landscape, portrait
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Spacer
-from reportlab.lib.units import cm
-import io
-import os
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-def hex_to_color(hex_color):
-    if not hex_color:
+# ── Theme color palette (Excel default Office theme) ──────────────────
+THEME_COLORS = [
+    'FFFFFF','000000','E7E6E6','44546A','4472C4','ED7D31',
+    'A9D18E','FF0000','FFFF00','00B0F0','70AD47','FFC000',
+    '5B9BD5','FF0000','92D050','00B050','FF7F00','0070C0',
+    '7030A0','000000'
+]
+
+def apply_tint(hex_color, tint):
+    """Apply tint to a hex color (tint: -1 to 1)"""
+    try:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        if tint > 0:
+            r = int(r + (255 - r) * tint)
+            g = int(g + (255 - g) * tint)
+            b = int(b + (255 - b) * tint)
+        elif tint < 0:
+            r = int(r * (1 + tint))
+            g = int(g * (1 + tint))
+            b = int(b * (1 + tint))
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+        return '{:02X}{:02X}{:02X}'.format(r, g, b)
+    except:
+        return hex_color
+
+def resolve_color(color_obj):
+    """Resolve openpyxl Color object to hex string"""
+    if color_obj is None:
         return None
-    h = str(hex_color).replace('#', '').strip()
-    if len(h) == 8:
-        h = h[2:]  # strip alpha (ARGB)
-    if len(h) != 6:
-        return None
-    if h.upper() in ('FFFFFF', '000000', 'FFFFFFF'):
+    try:
+        ctype = color_obj.type
+        if ctype == 'rgb':
+            rgb = color_obj.rgb
+            if rgb and len(rgb) >= 6:
+                h = rgb[-6:]  # last 6 chars (strip alpha)
+                if h.upper() not in ('FFFFFF', '000000', 'FFFFFFF'):
+                    return h
+        elif ctype == 'theme':
+            idx = color_obj.theme
+            tint = color_obj.tint or 0
+            if idx < len(THEME_COLORS):
+                base = THEME_COLORS[idx]
+                if tint != 0:
+                    base = apply_tint(base, tint)
+                if base.upper() not in ('FFFFFF', '000000'):
+                    return base
+        elif ctype == 'indexed':
+            idx = color_obj.indexed
+            # Common indexed colors
+            indexed_map = {
+                2:'FF0000', 3:'00FF00', 4:'0000FF', 5:'FFFF00',
+                6:'FF00FF', 7:'00FFFF', 8:'000000', 9:'FFFFFF',
+                10:'FF0000', 11:'00FF00', 12:'0000FF', 13:'FFFF00',
+                40:'FFFF99', 41:'CCFFFF', 42:'CCFFCC', 43:'FFCC99',
+                44:'FF99CC', 45:'CC99FF', 46:'99CCFF', 47:'FF9966',
+            }
+            if idx in indexed_map:
+                return indexed_map[idx]
+    except:
+        pass
+    return None
+
+def hex_to_rl(h):
+    if not h or len(h) < 6:
         return None
     try:
         r = int(h[0:2], 16) / 255.0
@@ -29,218 +89,229 @@ def hex_to_color(hex_color):
     except:
         return None
 
-def get_cell_bg_color(cell):
+def get_bg(cell):
     try:
         fill = cell.fill
-        if fill and fill.fill_type and fill.fill_type != 'none':
-            fg = fill.fgColor
-            if fg and fg.type == 'rgb':
-                return hex_to_color(fg.rgb)
+        if not fill or fill.fill_type in (None, 'none'):
+            return None
+        fg = fill.fgColor
+        h = resolve_color(fg)
+        return hex_to_rl(h) if h else None
     except:
-        pass
-    return None
+        return None
 
-def get_cell_font_color(cell):
+def get_fg(cell):
     try:
         font = cell.font
-        if font and font.color and font.color.type == 'rgb':
-            return hex_to_color(font.color.rgb)
+        if not font or not font.color:
+            return None
+        h = resolve_color(font.color)
+        return hex_to_rl(h) if h else None
     except:
-        pass
-    return None
+        return None
 
-def get_cell_bold(cell):
+def get_bold(cell):
     try:
         return bool(cell.font and cell.font.bold)
     except:
         return False
 
-def get_cell_align(cell):
+def get_align(cell):
     try:
         if cell.alignment and cell.alignment.horizontal:
-            return cell.alignment.horizontal
-        if cell.data_type == 'n':
+            a = cell.alignment.horizontal
+            if a in ('right','center','left'):
+                return a
+        if cell.data_type == 'n' and cell.value is not None:
             return 'right'
     except:
         pass
     return 'left'
 
-def format_cell_value(cell):
-    val = cell.value
-    if val is None:
+def fmt_val(cell):
+    v = cell.value
+    if v is None:
         return ''
-    if isinstance(val, float):
-        if val == int(val):
-            return f'{int(val):,}'
-        return f'{val:,.2f}'
-    if isinstance(val, int):
-        return f'{val:,}'
-    return str(val)
+    if isinstance(v, bool):
+        return 'TRUE' if v else 'FALSE'
+    if isinstance(v, float):
+        if v == int(v):
+            return '{:,}'.format(int(v))
+        return '{:,.2f}'.format(v)
+    if isinstance(v, int):
+        return '{:,}'.format(v)
+    return str(v)
+
+def is_row_empty(row):
+    return all(c.value is None for c in row)
+
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({'status':'ok','service':'Excel to PDF API v3'})
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'Excel to PDF API'})
+    return jsonify({'status':'ok'})
 
-@app.route('/convert/excel-to-pdf', methods=['POST', 'OPTIONS'])
-def excel_to_pdf():
+@app.route('/convert/excel-to-pdf', methods=['POST','OPTIONS'])
+def convert():
     if request.method == 'OPTIONS':
-        response = jsonify({'status': 'ok'})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        return response
+        r = jsonify({'ok':True})
+        r.headers['Access-Control-Allow-Origin'] = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'POST,OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
 
     if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+        return jsonify({'error':'No file'}), 400
 
-    file = request.files['file']
-    paper = request.form.get('paper', 'A4')
-    orientation = request.form.get('orientation', 'auto')
-    font_size = int(request.form.get('font_size', 9))
+    f = request.files['file']
+    paper       = request.form.get('paper','A4')
+    orient_pref = request.form.get('orientation','auto')
+    font_size   = int(request.form.get('font_size', 9))
 
     try:
-        file_bytes = io.BytesIO(file.read())
-        wb = openpyxl.load_workbook(file_bytes, data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(f.read()), data_only=True)
+        paper_map = {'A4':A4,'A3':A3,'Letter':letter}
+        base = paper_map.get(paper, A4)
+        MARGIN = 36
+        all_items = []
+        final_page_size = portrait(base)
 
-        paper_map = {'A4': A4, 'A3': A3, 'Letter': letter}
-        base_size = paper_map.get(paper, A4)
+        for sname in wb.sheetnames:
+            ws = wb[sname]
 
-        pdf_buffer = io.BytesIO()
-
-        all_elements = []
-
-        for sheet_idx, sheet_name in enumerate(wb.sheetnames):
-            ws = wb[sheet_name]
-            max_row = ws.max_row
-            max_col = ws.max_column
-            if not max_row or not max_col:
+            # Skip completely empty sheets
+            if ws.max_row is None or ws.max_column is None:
                 continue
 
-            # Read data and styles
-            table_data = []
-            style_grid = []
+            # Find actual data range (skip leading empty rows/cols)
+            rows_data = list(ws.iter_rows())
+            # Strip leading empty rows
+            while rows_data and is_row_empty(rows_data[0]):
+                rows_data = rows_data[1:]
+            # Strip trailing empty rows
+            while rows_data and is_row_empty(rows_data[-1]):
+                rows_data = rows_data[:-1]
 
-            for row in ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col):
-                row_vals = []
-                row_styles = []
-                for cell in row:
-                    row_vals.append(format_cell_value(cell))
-                    row_styles.append({
-                        'bg': get_cell_bg_color(cell),
-                        'fg': get_cell_font_color(cell),
-                        'bold': get_cell_bold(cell),
-                        'align': get_cell_align(cell),
+            if not rows_data:
+                continue
+
+            max_col = max(len(r) for r in rows_data)
+
+            # Build data & styles
+            data, sgrid = [], []
+            for row in rows_data:
+                rv, rs = [], []
+                for ci in range(max_col):
+                    cell = row[ci] if ci < len(row) else None
+                    rv.append(fmt_val(cell) if cell else '')
+                    rs.append({
+                        'bg':    get_bg(cell) if cell else None,
+                        'fg':    get_fg(cell) if cell else None,
+                        'bold':  get_bold(cell) if cell else False,
+                        'align': get_align(cell) if cell else 'left',
                     })
-                table_data.append(row_vals)
-                style_grid.append(row_styles)
+                data.append(rv)
+                sgrid.append(rs)
 
             # Column widths
-            col_widths = []
-            for col_idx in range(1, max_col + 1):
-                letter_col = openpyxl.utils.get_column_letter(col_idx)
-                dim = ws.column_dimensions.get(letter_col)
-                if dim and dim.width and dim.width > 1:
-                    col_widths.append(float(dim.width) * 5.5)
+            col_w = []
+            for ci in range(max_col):
+                # Get actual column letter from first data row
+                actual_ci = rows_data[0][ci].column if ci < len(rows_data[0]) else ci+1
+                ltr = openpyxl.utils.get_column_letter(actual_ci)
+                d = ws.column_dimensions.get(ltr)
+                if d and d.width and d.width > 1:
+                    col_w.append(float(d.width) * 5.8)
                 else:
-                    col_widths.append(55.0)
+                    # Estimate from content
+                    mx = max((len(str(data[ri][ci])) for ri in range(len(data))), default=5)
+                    col_w.append(max(float(mx) * 6.0, 40.0))
 
             # Row heights
-            row_heights = []
-            for row_idx in range(1, max_row + 1):
-                dim = ws.row_dimensions.get(row_idx)
-                if dim and dim.height and dim.height > 1:
-                    row_heights.append(float(dim.height) * 0.75)
+            row_h = []
+            for ri, row in enumerate(rows_data):
+                actual_ri = row[0].row if row else ri+1
+                d = ws.row_dimensions.get(actual_ri)
+                if d and d.height and d.height > 1:
+                    row_h.append(float(d.height) * 0.75)
                 else:
-                    row_heights.append(float(font_size) + 4.0)
+                    row_h.append(float(font_size) + 5.0)
 
-            total_w = sum(col_widths)
-            margin = 36
+            total_w = sum(col_w)
 
-            # Determine orientation
-            if orientation == 'landscape':
-                page_size = landscape(base_size)
-            elif orientation == 'portrait':
-                page_size = portrait(base_size)
+            # Orientation
+            if orient_pref == 'landscape':
+                page_size = landscape(base)
+            elif orient_pref == 'portrait':
+                page_size = portrait(base)
             else:
-                usable_p = base_size[0] - margin * 2
-                usable_l = base_size[1] - margin * 2
-                if total_w > usable_p and total_w <= usable_l:
-                    page_size = landscape(base_size)
-                else:
-                    page_size = portrait(base_size)
+                use_p = base[0] - MARGIN*2
+                use_l = base[1] - MARGIN*2
+                page_size = landscape(base) if total_w > use_p and total_w <= use_l else portrait(base)
 
-            usable_w = page_size[0] - margin * 2
+            final_page_size = page_size
+            usable = page_size[0] - MARGIN*2
 
-            # Scale if needed
-            if total_w > usable_w:
-                scale = usable_w / total_w
-                col_widths = [w * scale for w in col_widths]
-                row_heights = [max(h * scale, font_size + 2) for h in row_heights]
-                actual_font = max(6, int(font_size * scale))
+            # Scale
+            if total_w > usable:
+                sc = usable / total_w
+                col_w = [w*sc for w in col_w]
+                row_h = [max(h*sc, font_size+2) for h in row_h]
+                fs = max(6, int(font_size*sc))
             else:
-                actual_font = font_size
+                fs = font_size
 
-            # Build table style
-            style_cmds = [
-                ('FONTSIZE', (0, 0), (-1, -1), actual_font),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('GRID', (0, 0), (-1, -1), 0.4, colors.Color(0.8, 0.8, 0.8)),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 3),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 3),
-                ('TOPPADDING', (0, 0), (-1, -1), 2),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-                ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+            # Build ReportLab table style
+            cmds = [
+                ('FONTNAME',      (0,0),(-1,-1), 'Helvetica'),
+                ('FONTSIZE',      (0,0),(-1,-1), fs),
+                ('BACKGROUND',    (0,0),(-1,-1), colors.white),
+                ('GRID',          (0,0),(-1,-1), 0.4, colors.Color(0.82,0.82,0.82)),
+                ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+                ('LEFTPADDING',   (0,0),(-1,-1), 3),
+                ('RIGHTPADDING',  (0,0),(-1,-1), 3),
+                ('TOPPADDING',    (0,0),(-1,-1), 2),
+                ('BOTTOMPADDING', (0,0),(-1,-1), 2),
             ]
 
-            for r_idx, row_styles in enumerate(style_grid):
-                for c_idx, st in enumerate(row_styles):
-                    coord = (c_idx, r_idx)
+            rl_align = {'right':'RIGHT','center':'CENTER','left':'LEFT'}
+
+            for ri, rs in enumerate(sgrid):
+                for ci, st in enumerate(rs):
+                    coord = (ci, ri)
                     if st['bg']:
-                        style_cmds.append(('BACKGROUND', coord, coord, st['bg']))
+                        cmds.append(('BACKGROUND', coord, coord, st['bg']))
                     if st['fg']:
-                        style_cmds.append(('TEXTCOLOR', coord, coord, st['fg']))
+                        cmds.append(('TEXTCOLOR',  coord, coord, st['fg']))
                     if st['bold']:
-                        style_cmds.append(('FONTNAME', coord, coord, 'Helvetica-Bold'))
-                    align_map = {'right': 'RIGHT', 'center': 'CENTER', 'left': 'LEFT'}
-                    rl_align = align_map.get(st['align'], 'LEFT')
-                    style_cmds.append(('ALIGN', coord, coord, rl_align))
+                        cmds.append(('FONTNAME',   coord, coord, 'Helvetica-Bold'))
+                    cmds.append(('ALIGN', coord, coord, rl_align.get(st['align'],'LEFT')))
 
-            table = Table(
-                table_data,
-                colWidths=col_widths,
-                rowHeights=row_heights,
-                repeatRows=1
-            )
-            table.setStyle(TableStyle(style_cmds))
-            all_elements.append(table)
+            tbl = Table(data, colWidths=col_w, rowHeights=row_h, repeatRows=1)
+            tbl.setStyle(TableStyle(cmds))
+            all_items.append(tbl)
 
-        if not all_elements:
-            return jsonify({'error': 'No data found'}), 400
+        if not all_items:
+            return jsonify({'error':'No data found'}), 400
 
+        pdf_buf = io.BytesIO()
         doc = SimpleDocTemplate(
-            pdf_buffer,
-            pagesize=page_size,
-            leftMargin=margin,
-            rightMargin=margin,
-            topMargin=margin,
-            bottomMargin=margin + 12
+            pdf_buf, pagesize=final_page_size,
+            leftMargin=MARGIN, rightMargin=MARGIN,
+            topMargin=MARGIN,  bottomMargin=MARGIN+12,
         )
-        doc.build(all_elements)
-        pdf_buffer.seek(0)
+        doc.build(all_items)
+        pdf_buf.seek(0)
 
-        out_name = (file.filename or 'output').rsplit('.', 1)[0] + '.pdf'
-        return send_file(
-            pdf_buffer,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=out_name
-        )
+        out = (f.filename or 'output').rsplit('.',1)[0] + '.pdf'
+        return send_file(pdf_buf, mimetype='application/pdf',
+                         as_attachment=True, download_name=out)
 
     except Exception as e:
-        import traceback
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
